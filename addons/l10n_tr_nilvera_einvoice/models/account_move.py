@@ -186,10 +186,15 @@ class AccountMove(models.Model):
                     if not document_category or not invoice_channel:
                         continue
 
-                    response = client.request(
-                        "GET",
-                        f"/{invoice_channel}/{quote(document_category)}/{invoice.l10n_tr_nilvera_uuid}/Status",
-                    )
+                    try:
+                        response = client.request(
+                            "GET",
+                            f"/{invoice_channel}/{quote(document_category)}/{invoice.l10n_tr_nilvera_uuid}/Status",
+                        )
+                    except UserError as error:
+                        # Do not let one rejected document stop the status update of the others.
+                        invoice.message_post(body=Markup("%s<br/>%s") % (_("The invoice status couldn't be retrieved from Nilvera."), error))
+                        continue
 
                     nilvera_status = response.get('InvoiceStatus', {}).get('Code') or response.get('StatusCode')
                     if nilvera_status in dict(invoice._fields['l10n_tr_nilvera_send_status'].selection):
