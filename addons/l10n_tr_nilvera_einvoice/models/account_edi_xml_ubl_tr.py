@@ -1,4 +1,6 @@
 import math
+import re
+import unicodedata
 
 from num2words import num2words
 
@@ -8,6 +10,18 @@ from odoo.tools import float_round, html2plaintext
 
 # InvoiceTypeCodes representing refunds in Nilvera documents.
 TR_REFUND_TYPE_CODES = {'IADE', 'TEVKIFATIADE'}
+# A Turkish taxpayer is identified by a 10-digit VKN (companies) or an 11-digit TCKN (natural persons).
+TR_TAX_ID_RE = re.compile(r'^\d{10}$|^\d{11}$')
+# Spellings of Türkiye met in cac:Country/cbc:Name when no cbc:IdentificationCode is given.
+TR_COUNTRY_NAMES = {'turkiye', 'turkey', 'turkiye cumhuriyeti', 'republic of turkiye', 'republic of turkey', 'tc', 'tr'}
+
+
+def _normalize_country_name(name):
+    """ 'TÜRKİYE', 'Türkiye', 'Turkey' -> 'turkiye', 'turkiye', 'turkey': drop the accents, the case and the punctuation. """
+    if not name:
+        return ''
+    decomposed = unicodedata.normalize('NFKD', name.replace('ı', 'i'))
+    return re.sub(r'[^a-z ]', '', ''.join(char for char in decomposed if not unicodedata.combining(char)).lower()).strip()
 
 
 class AccountEdiXmlUblTr(models.AbstractModel):
@@ -319,9 +333,35 @@ class AccountEdiXmlUblTr(models.AbstractModel):
     def _import_retrieve_partner_vals(self, tree, role):
         # EXTENDS account.edi.xml.ubl_20
         partner_vals = super()._import_retrieve_partner_vals(tree, role)
-        partner_vals.update({
-            'vat': self._find_value(f'.//cac:Accounting{role}Party/cac:Party//cac:PartyIdentification//cbc:ID[string-length(text()) > 5]', tree),
-        })
+        party = tree.find(f'.//{{*}}{role}Party/{{*}}Party')
+        if party is None:
+            return partner_vals
+
+        # A party carries several identifications (trade registry number, MERSIS number, ...): the tax identifier
+        # is the one whose scheme is VKN (companies) or TCKN (natural persons).
+        identifications = {
+            (node.get('schemeID') or '').upper(): node.text.strip()
+            for node in party.findall('./{*}PartyIdentification/{*}ID')
+            if node.text and node.text.strip()
+        }
+        vat = identifications.get('VKN') or identifications.get('TCKN')
+        if not vat:
+            # Without those schemes, accept a CompanyID only when it is shaped like a VKN/TCKN: the one of the
+            # PartyLegalEntity often holds the MERSIS or the trade registry number.
+            for xpath in ('./{*}PartyTaxScheme/{*}CompanyID', './{*}PartyLegalEntity/{*}CompanyID', './/{*}CompanyID'):
+                company_ids = [(node.text or '').replace(' ', '') for node in party.findall(xpath)]
+                vat = next((company_id for company_id in company_ids if TR_TAX_ID_RE.match(company_id)), None)
+                if vat:
+                    break
+        partner_vals['vat'] = vat
+
+        # The country is often given by its name only ("TÜRKİYE"). Without a code, the created partner has no
+        # country and its tax identifier cannot be checked.
+        postal_address = partner_vals.get('postal_address') or {}
+        if not postal_address.get('country_code'):
+            country_name = party.findtext('./{*}PostalAddress/{*}Country/{*}Name')
+            if _normalize_country_name(country_name) in TR_COUNTRY_NAMES or (vat and not country_name):
+                partner_vals['postal_address'] = {**postal_address, 'country_code': 'TR'}
         return partner_vals
 
     def _get_import_document_amount_sign(self, tree):
