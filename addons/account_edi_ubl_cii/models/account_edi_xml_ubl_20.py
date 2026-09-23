@@ -1,3 +1,5 @@
+from collections import defaultdict
+
 from lxml import etree
 
 from odoo import _, models, Command
@@ -1274,6 +1276,9 @@ class AccountEdiXmlUBL20(models.AbstractModel):
         # Negative tax amounts may appear in invoices; they have to be inverted (since they are credit notes).
         document_amount_sign = self._get_import_document_amount_sign(tree)[1] or 1
         # We only search for `TaxTotal/TaxSubtotal` in the "root" element (i.e. not in `InvoiceLine` elements).
+        # Several subtotals may share the same rate (one per tax category, tax scheme, ...): they are compared to
+        # the same tax lines, so their amounts are summed before the comparison.
+        tax_totals = defaultdict(float)
         for elem in tree.findall('./{*}TaxTotal/{*}TaxSubtotal'):
             percentage = elem.find('.//{*}TaxCategory/{*}Percent')
             if percentage is None:
@@ -1284,21 +1289,46 @@ class AccountEdiXmlUBL20(models.AbstractModel):
             if amount is not None and amount.get('currencyID') != currency.name:
                 continue
             if (percentage is not None and percentage.text is not None) and (amount is not None and amount.text is not None):
-                tax_percent = float(percentage.text)
-                # Compare the result with our tax total on the invoice, and apply correction if needed.
-                # First look for taxes matching the percentage in the xml.
-                taxes = invoice.line_ids.tax_line_id.filtered(lambda tax: tax.amount == tax_percent)
-                # If we found taxes with the correct amount, look for a tax line using it, and correct it as needed.
-                if taxes:
-                    tax_total = document_amount_sign * float(amount.text)
-                    # Sometimes we have multiple lines for the same tax.
-                    tax_lines = invoice.line_ids.filtered(lambda line: line.tax_line_id in taxes)
-                    if tax_lines:
-                        sign = -1 if invoice.is_inbound(include_receipts=True) else 1
-                        tax_lines_total = currency.round(sign * sum(tax_lines.mapped('amount_currency')))
-                        difference = currency.round(tax_total - tax_lines_total)
-                        if not currency.is_zero(difference):
-                            tax_lines[0].amount_currency += sign * difference
+                tax_totals[float(percentage.text)] += document_amount_sign * float(amount.text)
+
+        sign = -1 if invoice.is_inbound(include_receipts=True) else 1
+        for tax_percent, tax_total in tax_totals.items():
+            # Compare the result with our tax total on the invoice, and apply correction if needed.
+            # First look for taxes matching the percentage in the xml.
+            taxes = invoice.line_ids.tax_line_id.filtered(lambda tax: tax.amount == tax_percent)
+            # If we found taxes with the correct amount, look for the tax lines using them, and correct them as needed.
+            # Sometimes we have multiple lines for the same tax.
+            tax_lines = invoice.line_ids.filtered(lambda line: line.tax_line_id in taxes)
+            if not tax_lines:
+                continue
+            tax_lines_total = currency.round(sign * sum(tax_lines.mapped('amount_currency')))
+            difference = currency.round(tax_total - tax_lines_total)
+            if not currency.is_zero(difference):
+                self._correct_tax_lines_amount(tax_lines, sign * difference, currency)
+
+    def _correct_tax_lines_amount(self, tax_lines, difference, currency):
+        """ Add 'difference' (expressed like 'amount_currency') to the tax lines of one tax, spread over its
+        repartition lines according to their factor so that the repartition stays consistent: a tax booked as
+        +100% / -100% on two accounts must move on both lines, not only on the first one.
+        """
+        for tax in tax_lines.tax_line_id:
+            lines_per_repartition_line = tax_lines.filtered(lambda line: line.tax_line_id == tax).grouped('tax_repartition_line_id')
+            total_factor = sum(repartition_line.factor_percent for repartition_line in lines_per_repartition_line)
+            if float_is_zero(total_factor, precision_digits=12):
+                # The repartition lines cancel each other (e.g. a tax used to book a memo entry): this tax cannot
+                # absorb the difference, try the next one.
+                continue
+            remaining = difference
+            repartition_lines = list(lines_per_repartition_line)
+            for repartition_line in repartition_lines:
+                if repartition_line == repartition_lines[-1]:
+                    share = remaining
+                else:
+                    share = currency.round(difference * repartition_line.factor_percent / total_factor)
+                    remaining -= share
+                lines_per_repartition_line[repartition_line][0].amount_currency += share
+            return
+
     # -------------------------------------------------------------------------
     # IMPORT : helpers
     # -------------------------------------------------------------------------
