@@ -25,4 +25,5 @@ from . import test_ubl_import_bis3_invoice_be_retrieve_account
 from . import test_ubl_import_bis3_invoice_be_retrieve_partner
 from . import test_ubl_import_bis3_invoice_be_retrieve_product
 from . import test_ubl_import_bis3_invoice_be_retrieve_tax
+from . import test_ubl_import_ubl_21_invoice_be
 from . import test_ubl_export_bis3_invoice_selfbilling_be

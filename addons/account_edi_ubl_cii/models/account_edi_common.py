@@ -835,17 +835,16 @@ class AccountEdiCommon(models.AbstractModel):
         if invoice.currency_id.is_zero(rounding_amount_currency):
             return lines_values, logs
 
-        inverse_rate = abs(invoice.amount_total_signed) / invoice.amount_total if invoice.amount_total else 0
-        rounding_amount = invoice.company_id.currency_id.round(rounding_amount_currency * inverse_rate)
-
+        # Like every other imported line, 'amount_currency' and 'balance' are left to the ORM: they are derived
+        # from 'price_unit' at the invoice rate. Passing them explicitly here is wrong on two counts: the invoice
+        # has no line yet when this runs (so any rate derived from its totals is 0), and a line created with an
+        # explicit balance in the same batch as the other lines prevents those from getting a balance at all.
         lines_values.append({
             'display_type': 'product',
             'name': _('Rounding'),
             'quantity': 1,
             'product_id': False,
             'price_unit': rounding_amount_currency,
-            'amount_currency': invoice.direction_sign * rounding_amount_currency,
-            'balance': invoice.direction_sign * rounding_amount,
             'company_id': invoice.company_id.id,
             'move_id': invoice.id,
             'tax_ids': False,
