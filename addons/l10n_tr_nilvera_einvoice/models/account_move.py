@@ -1,5 +1,6 @@
 import uuid
 from base64 import b64decode
+from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from markupsafe import Markup
 from urllib.parse import quote, urlencode, urlparse
@@ -25,6 +26,11 @@ CATEGORY_MOVE_TYPE_MAP = {
     "sale": "out_invoice",
     "purchase": "in_invoice",
 }
+
+# Nilvera rejects a listing whose StartDate..EndDate range exceeds 6 months. The shortest 6 consecutive months
+# (September to February in a non-leap year) span 181 days, so 180 days are always accepted.
+NILVERA_MAX_FETCH_WINDOW_DAYS = 180
+NILVERA_DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
 
 class AccountMove(models.Model):
@@ -227,60 +233,105 @@ class AccountMove(models.Model):
             self.env['ir.config_parameter'].sudo().set_param(param_key, last_fetched_date)
         return last_fetched_date
 
+    @api.model
+    def _l10n_tr_nilvera_parse_fetch_date(self, value):
+        """ Parse a stored 'last_fetched_date' into a naive datetime.
+
+        The parameter holds either a date (YYYY-MM-DD, the default) or the CreatedDate string returned by Nilvera
+        (ISO 8601). Both are expressed in Nilvera's time zone, like the EndDate sent to it.
+        Returns None when the value cannot be parsed, in which case it is sent to Nilvera as is.
+        """
+        try:
+            parsed = datetime.fromisoformat(str(value).strip())
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=None)
+
+    @api.model
+    def _l10n_tr_nilvera_get_fetch_windows(self, start_date, end_datetime):
+        """ Split the range [start_date, end_datetime] into consecutive windows of at most
+        NILVERA_MAX_FETCH_WINDOW_DAYS days.
+
+        :param start_date: the stored 'last_fetched_date' string, sent as is for the first window.
+        :param end_datetime: naive datetime of "now" in Nilvera's time zone.
+        :return: a list of (start, end, window_end) where start and end are the strings to send and window_end is
+                 the datetime to store once the window is fully processed (None for the last window, whose end is
+                 "now" and which is only advanced by the fetched documents).
+        """
+        end = end_datetime.strftime(NILVERA_DATETIME_FORMAT)
+        start_datetime = self._l10n_tr_nilvera_parse_fetch_date(start_date)
+        window = timedelta(days=NILVERA_MAX_FETCH_WINDOW_DAYS)
+        windows = []
+        while start_datetime is not None and start_datetime + window < end_datetime:
+            window_end = start_datetime + window
+            windows.append((start_date, window_end.strftime(NILVERA_DATETIME_FORMAT), window_end))
+            start_date, start_datetime = window_end.strftime(NILVERA_DATETIME_FORMAT), window_end
+        windows.append((start_date, end, None))
+        return windows
+
     def _l10n_tr_nilvera_get_documents(self, invoice_channel="einvoice", document_category="Purchase", journal_type="purchase"):
+        endpoint = f"/{invoice_channel}/{quote(document_category)}"
+        date_param_key = f"l10n_tr_nilvera_{invoice_channel}_{journal_type}.last_fetched_date.{self.env.company.id}"
+        config_parameter = self.env['ir.config_parameter'].sudo()
+        start_date = self._get_nilvera_last_fetch_date(invoice_channel, journal_type)
+        end_datetime = fields.Datetime.context_timestamp(self.with_context(tz='Europe/Istanbul'), fields.Datetime.now()).replace(tzinfo=None)
+        # Nilvera rejects a range longer than 6 months. Fetching it in windows lets a company whose last fetch is
+        # older than that catch up instead of failing on every run.
+        windows = self._l10n_tr_nilvera_get_fetch_windows(start_date, end_datetime)
+
+        moves = self.env['account.move']
+        journal = self._l10n_tr_get_nilvera_invoice_journal(journal_type)
         with _get_nilvera_client(self.env.company) as client:
-            endpoint = f"/{invoice_channel}/{quote(document_category)}"
-            start_date = self._get_nilvera_last_fetch_date(invoice_channel, journal_type)
-            end_date = fields.Datetime.context_timestamp(self.with_context(tz='Europe/Istanbul'), fields.Datetime.now()).strftime("%Y-%m-%dT%H:%M:%S")
-            page = 1
-
-            # We filter documents by their CreatedDate on Nilvera, which represents when the document was created on
-            # their platform. This ensures we always fetch the most recently uploaded documents, regardless of their
-            # actual invoicing date (which might be much older).
-            # The sorting allows us to resume from the last successfully fetched document in case an error interrupts
-            # the batch fetching process.
-            params = {
-                'StatusCode': ['succeed'],
-                'StartDate': start_date,
-                'EndDate': end_date,
-                'DateFilterType': 'CreatedDate',
-                'SortColumn': 'CreationDateTime',
-                'SortType': 'ASC',
-            }
-            response = client.request("GET", endpoint, params={**params, "Page": page})
-            total_pages = response.get("TotalPages")
-            if not total_pages:
-                return
-
-            moves = self.env['account.move']
-            journal = self._l10n_tr_get_nilvera_invoice_journal(journal_type)
-            date_param_key = f"l10n_tr_nilvera_{invoice_channel}_{journal_type}.last_fetched_date.{self.env.company.id}"
-            while page <= total_pages:
-                # Reuse first response, fetch subsequent pages.
-                if page > 1:
-                    response = client.request("GET", endpoint, params={**params, "Page": page})
-
-                uuid_to_created_date = {
-                    content.get('UUID'): content.get('CreatedDate')
-                    for content in response.get('Content')
+            for window_start, window_end, window_end_datetime in windows:
+                # We filter documents by their CreatedDate on Nilvera, which represents when the document was created
+                # on their platform. This ensures we always fetch the most recently uploaded documents, regardless of
+                # their actual invoicing date (which might be much older).
+                # The sorting allows us to resume from the last successfully fetched document in case an error
+                # interrupts the batch fetching process.
+                params = {
+                    'StatusCode': ['succeed'],
+                    'StartDate': window_start,
+                    'EndDate': window_end,
+                    'DateFilterType': 'CreatedDate',
+                    'SortColumn': 'CreationDateTime',
+                    'SortType': 'ASC',
                 }
-                existing_document_uuids = {
-                    rec['l10n_tr_nilvera_uuid'] for rec in self.env['account.move'].search_read(
-                        [('l10n_tr_nilvera_uuid', 'in', list(uuid_to_created_date))],
-                        ['l10n_tr_nilvera_uuid'],
-                    )
-                }
-                for document_uuid, created_date in uuid_to_created_date.items():
-                    # Skip invoices that have already been downloaded.
-                    if document_uuid in existing_document_uuids:
-                        continue
-                    move = self._l10n_tr_nilvera_get_invoice_from_uuid(client, journal, document_uuid, document_category, invoice_channel)
-                    self._l10n_tr_nilvera_add_pdf_to_invoice(client, move, document_uuid, document_category, invoice_channel)
-                    moves |= move
-                    # Update the last fetched date.
-                    self.env['ir.config_parameter'].sudo().set_param(date_param_key, created_date)
+                page = 1
+                response = client.request("GET", endpoint, params={**params, "Page": page})
+                total_pages = response.get("TotalPages") or 0
+                while page <= total_pages:
+                    # Reuse first response, fetch subsequent pages.
+                    if page > 1:
+                        response = client.request("GET", endpoint, params={**params, "Page": page})
+
+                    uuid_to_created_date = {
+                        content.get('UUID'): content.get('CreatedDate')
+                        for content in response.get('Content')
+                    }
+                    existing_document_uuids = {
+                        rec['l10n_tr_nilvera_uuid'] for rec in self.env['account.move'].search_read(
+                            [('l10n_tr_nilvera_uuid', 'in', list(uuid_to_created_date))],
+                            ['l10n_tr_nilvera_uuid'],
+                        )
+                    }
+                    for document_uuid, created_date in uuid_to_created_date.items():
+                        # Skip invoices that have already been downloaded.
+                        if document_uuid in existing_document_uuids:
+                            continue
+                        move = self._l10n_tr_nilvera_get_invoice_from_uuid(client, journal, document_uuid, document_category, invoice_channel)
+                        self._l10n_tr_nilvera_add_pdf_to_invoice(client, move, document_uuid, document_category, invoice_channel)
+                        moves |= move
+                        # Update the last fetched date.
+                        config_parameter.set_param(date_param_key, created_date)
+                        self.env.cr.commit()
+                    page += 1
+
+                if window_end_datetime is not None:
+                    # The window is fully processed: an interrupted run must not start over from the original date.
+                    config_parameter.set_param(date_param_key, window_end)
                     self.env.cr.commit()
-                page += 1
+
+        if moves:
             journal._notify_einvoices_received(moves)
 
     def _l10n_tr_get_nilvera_invoice_journal(self, journal_type):

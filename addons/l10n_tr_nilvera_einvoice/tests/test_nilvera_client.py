@@ -1,13 +1,16 @@
 import json
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import requests
 
 from odoo.exceptions import UserError
-from odoo.tests import tagged
+from odoo.tests import freeze_time, tagged
 
 from odoo.addons.l10n_tr_nilvera.lib.nilvera_client import NilveraClient
-from odoo.addons.l10n_tr_nilvera_einvoice.tests.test_xml_ubl_tr_common import TestUBLTRCommon
+from odoo.addons.l10n_tr_nilvera_einvoice.tests.test_xml_ubl_tr_common import (
+    TestUBLTRCommon,
+)
 
 UNAUTHORISED_MESSAGE = "Oops, seems like you're unauthorised to do this. Try another API key with more rights or contact Nilvera."
 NILVERA_400_BODY = {
@@ -94,7 +97,8 @@ class TestNilveraClient(TestUBLTRCommon):
 
         def mock_request(method, url, *args, **kwargs):
             if 'rejected_uuid' in url:
-                raise UserError("Nilvera rejected the request (HTTP 400): GECERSIZ ISTEK")
+                message = "Nilvera rejected the request (HTTP 400): GECERSIZ ISTEK"
+                raise UserError(message)
             return {'InvoiceStatus': {'Code': 'succeed', 'Description': 'text', 'DetailDescription': 'text'}}
 
         with patch.object(NilveraClient, 'request', side_effect=mock_request):
@@ -103,3 +107,33 @@ class TestNilveraClient(TestUBLTRCommon):
         self.assertEqual(accepted.l10n_tr_nilvera_send_status, 'succeed')
         self.assertNotEqual(rejected.l10n_tr_nilvera_send_status, 'succeed')
         self.assertIn('GECERSIZ ISTEK', str(rejected.message_ids[0].body))
+
+    @freeze_time('2026-09-21 09:00:00')
+    def test_fetch_documents_splits_long_ranges(self):
+        # Nilvera rejects a range longer than 6 months: 400 days are fetched in windows of at most 180 days.
+        param_key = f"l10n_tr_nilvera_einvoice_purchase.last_fetched_date.{self.company_data['company'].id}"
+        self.env['ir.config_parameter'].sudo().set_param(param_key, '2025-08-17')
+
+        with patch.object(NilveraClient, 'request', return_value={'TotalPages': 0, 'Content': []}) as mocked_request, \
+             patch.object(self.env.cr, 'commit', autospec=True):
+            self.env['account.move']._l10n_tr_nilvera_get_documents()
+
+        listings = [call.kwargs['params'] for call in mocked_request.call_args_list]
+        self.assertEqual(len(listings), 3)
+        previous_end = None
+        for params in listings:
+            start = datetime.fromisoformat(params['StartDate'])
+            end = datetime.fromisoformat(params['EndDate'])
+            self.assertLessEqual(end - start, timedelta(days=180), params)
+            if previous_end:
+                self.assertEqual(start, previous_end, "the windows must be contiguous")
+            previous_end = end
+            self.assertEqual(
+                {key: value for key, value in params.items() if key not in ('StartDate', 'EndDate')},
+                {'StatusCode': ['succeed'], 'DateFilterType': 'CreatedDate', 'SortColumn': 'CreationDateTime', 'SortType': 'ASC', 'Page': 1},
+            )
+        self.assertEqual(listings[0]['StartDate'], '2025-08-17')
+        self.assertEqual(listings[-1]['EndDate'], '2026-09-21T12:00:00')  # now, in Europe/Istanbul
+        # The completed windows are saved so that an interrupted run resumes from them; the last window is only
+        # advanced by the fetched documents.
+        self.assertEqual(self.env['ir.config_parameter'].sudo().get_param(param_key), listings[-1]['StartDate'])
